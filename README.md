@@ -1122,11 +1122,16 @@ bash examples/arrangement_demo.sh
 正式修订）/ `field_package`（野外整包汇入产生的正式修订）/
 `field_package_correction`（野外整包勘误替换产生的正式修订）。
 
-**历史修订可追溯**：服务启动时幂等检查 `revisions` 审计，对部署前已存在、尚未
-追踪的历史修订按当时断言集（`added_revision` / `retracted_revision` 回放）重算
-旧/新关系与最优路径并回填；推演并入的历史修订 `source` 按审计记录还原为
-`projection_merge`，野外整包汇入 / 勘误分别还原为 `field_package` /
-`field_package_correction`。再次启动不会重复（按修订封口）。
+**历史修订可追溯**：服务启动时幂等检查 `revisions` 审计，只对**未封口**的历史
+修订（`revision_changes_sealed` 中无标记者；在线提交成功即封口，含零变化修订）
+按当时断言集（`added_revision` / `retracted_revision` 回放）重算关系与最优路径
+并回填。每个待补修订一律以**紧邻上一正式修订**（无论已封口还是同样待补）提交
+时刻的生效断言为前态、本修订为后态——已封口与待补修订交错时不会把待补修订
+误与空库比较而漏记撤回（否则撤回证据不出现于空前态、成果包“首次偏离”失真）；
+已封口修订只作后继待补修订的前态锚点，不重写。推演并入的历史修订 `source`
+按审计记录还原为 `projection_merge`，野外整包汇入 / 勘误分别还原为
+`field_package` / `field_package_correction`。修订计数器行锁令回填与在线提交
+互斥，封口主键兜底，故重复启动、回填与在线提交交错均不重写、不漏记、不重复。
 
 ```bash
 # 首屏
@@ -1136,6 +1141,8 @@ curl "$BASE/revision-changes?limit=100&cursor=eyJiIjo1LCJyIjoxLCJzIjozLCJ2IjoxfQ
 
 # 完整端到端示例（含失败批次 / 推演并入 / 路径变化 / 分页上界）
 bash examples/changes_demo.sh
+# 启动回填（含已封口/待补交错）与成果包复核“首次偏离”端到端示例
+bash examples/changes_backfill_reconcile_demo.sh
 ```
 
 ## 推演（证据修订沙盘）

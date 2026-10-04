@@ -14,8 +14,10 @@
 
 历史可追溯性：旧侧关系与路径均按**该修订提交前**的当时状态推导。后来才被
 撤回的证据在旧侧仍按当时生效解释（提交时刻已能拿到完整的当时断言集，无需
-回放后来的撤回）。服务启动时对部署前已存在的历史修订做幂等回填，使“已有
-历史修订也应可追溯”。
+回放后来的撤回）。服务启动时对部署前已存在且**未封口**的历史修订做幂等回填，
+每个待补修订一律以**紧邻上一正式修订**（已封口或同样待补）的当时生效断言为
+前态、本修订为后态，已封口修订只作前态锚点不重写，使“已有历史修订也应
+可追溯”，且已封口 / 待补交错时不会把待补修订误与空库比较而漏记撤回。
 
 变化计算（性能口径）：一次局部断言变更不再对全库地层逐对重算。先依据提交
 前后生效断言集的差异定位**候选地层对**——每条新增 / 撤回证据在其存在的一侧，
@@ -262,46 +264,62 @@ def _active_assertions_at(cur, revision: Optional[int]) -> List[Assertion]:
     return [Assertion(evidence_id=r[0], a=r[1], b=r[2], relation=r[3]) for r in cur.fetchall()]
 
 
-def backfill_revision_changes(cur) -> int:
-    """启动时幂等回填历史修订的变化记录，返回回填的修订数。
+def _revision_source(batch: Any) -> str:
+    """按修订审计记录还原变化来源（推演并入 / 野外汇入 / 勘误 / 正式批次）。"""
+    if isinstance(batch, dict) and batch.get("source") == "projection_merge":
+        return "projection_merge"
+    if isinstance(batch, dict) and batch.get("source") == "field_package":
+        return "field_package"
+    if isinstance(batch, dict) and batch.get("source") == "field_package_correction":
+        return "field_package_correction"
+    return "formal_batch"
 
-    以每个历史修订为界：地层取截至该修订提交时刻已登记的；
-    旧侧断言集取上一修订时刻（最早修订取空集），新侧取本修订时刻。
+
+def backfill_revision_changes(cur) -> int:
+    """启动时幂等回填**未封口**历史修订的变化记录，返回回填的修订数。
+
+    前态口径（修复要点）：每个待补修订都以**紧邻上一正式修订**提交时刻的
+    生效断言为前态、本修订提交时刻为后态——无论紧邻上一修订已封口还是同样
+    待补。已封口与待补修订交错时，不得把待补修订与空库比较：否则待补修订
+    撤回的证据不出现在空前态里，撤回被漏记，成果包首次偏离随之失真。
+
+    - 全部正式修订一次性取出（不是只取待补序列），按修订号升序逐个推进，
+      “紧邻上一修订”就是序列中的前一行；首个修订的前态为空库（None）。
+    - 已封口修订跳过不重写，只把其修订号推进为后继待补修订的前态锚点；
+      待补修订无论是否有净变化都补写封口标记（insert 对零变化修订只封口）。
+    - 修订计数器行锁令回填与在线提交互斥；封口标记 PRIMARY KEY 兜底重复
+      启动与回填中的在线交错：已封口的永不重写、不漏项、不重复。
+
     source 尽量按当时审计记录还原（推演并入的 batch 带 source=projection_merge），
-    其余为正式批次。在线提交与启动回填都写 revision_changes_sealed 封口标记，
-    故不重复。
+    其余为正式批次。
     """
     # 锁定修订计数器，回填与在线提交互斥（启动阶段实际无并发，双保险）
     cur.execute("SELECT revision FROM revision_counter WHERE id = TRUE FOR UPDATE")
-    cur.execute(
-        "SELECT revision, applied_at, batch FROM revisions "
-        "WHERE revision NOT IN (SELECT revision FROM revision_changes_sealed) "
-        "ORDER BY revision"
-    )
-    pending = cur.fetchall()
-    if not pending:
+    cur.execute("SELECT revision FROM revision_changes_sealed")
+    sealed = {r[0] for r in cur.fetchall()}
+    cur.execute("SELECT revision, applied_at, batch FROM revisions ORDER BY revision")
+    all_revisions = cur.fetchall()
+    if not sealed and not all_revisions:
         return 0
 
     cur.execute("SELECT stratum_id, created_at FROM strata")
     strata_created = {r[0]: r[1] for r in cur.fetchall()}
 
+    backfilled = 0
     prev_revision: Optional[int] = None
-    for revision, applied_at, batch in pending:
+    for revision, applied_at, batch in all_revisions:
+        if revision in sealed:
+            # 已封口（在线提交或先前回填写过）：不重写，仅作为后继待补修订的前态锚点
+            prev_revision = revision
+            continue
         before_assertions = _active_assertions_at(cur, prev_revision)
         after_assertions = _active_assertions_at(cur, revision)
         strata = [s for s, created in strata_created.items() if created <= applied_at]
         diffs = relation_diffs(strata, before_assertions, after_assertions)
-        if isinstance(batch, dict) and batch.get("source") == "projection_merge":
-            source = "projection_merge"
-        elif isinstance(batch, dict) and batch.get("source") == "field_package":
-            source = "field_package"
-        elif isinstance(batch, dict) and batch.get("source") == "field_package_correction":
-            source = "field_package_correction"
-        else:
-            source = "formal_batch"
-        insert_revision_changes(cur, revision, diffs, source)
+        insert_revision_changes(cur, revision, diffs, _revision_source(batch))
+        backfilled += 1
         prev_revision = revision
-    return len(pending)
+    return backfilled
 
 
 # ------------------------------------------------------------------ 游标分页
