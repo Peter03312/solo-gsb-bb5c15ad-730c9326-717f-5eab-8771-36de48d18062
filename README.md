@@ -33,7 +33,9 @@
 - **修订变化追踪**：对每次成功的正式断言批次及推演并入产生的正式修订，记录提交前后
   关系结论或最优支撑路径发生变化的地层对；同一对按地层编号固定顺序只列一次；
   关系不变但最优路径改变也记录；变为未定时路径为空。记录与批次同事务原子写入，
-  失败批次、推演内编辑、无净变更并入不产生记录；已有历史修订在服务启动时幂等回填。
+  失败批次、推演内编辑、无净变更并入不产生记录；已有历史修订在服务启动时幂等回填
+  （每个待补修订以紧邻上一正式修订的当时生效断言为前态，封口/待补交错也不漏撤回；
+  零变化修订同样封口，重复启动与在线提交交错不重写、不漏记、不重复）。
 - **推演（沙盘）**：创建时固定当前正式修订号、已登记地层与生效断言；推演内沿用正式批次的
   新增 / 撤回 / 整批核验语义（携带推演自身修订号），正式状态始终不变。提交（并入）时把推演
   **相对基线的净变更**应用于最新正式状态并重新核验：基线目标已撤回 / 编号已被正式占用 /
@@ -1124,9 +1126,15 @@ bash examples/arrangement_demo.sh
 
 **历史修订可追溯**：服务启动时幂等检查 `revisions` 审计，对部署前已存在、尚未
 追踪的历史修订按当时断言集（`added_revision` / `retracted_revision` 回放）重算
-旧/新关系与最优路径并回填；推演并入的历史修订 `source` 按审计记录还原为
-`projection_merge`，野外整包汇入 / 勘误分别还原为 `field_package` /
-`field_package_correction`。再次启动不会重复（按修订封口）。
+旧/新关系与最优路径并回填。每个待补修订都以**紧邻上一正式修订**（无论该上一修订
+是否已封口）提交时刻的生效断言为前态、以本修订提交时刻为后态——**已封口修订与
+待补修订交错**时也不例外：例如修订 1 已封口、修订 2 撤回证据使关系变未定且修订 2
+待补，回填仍以修订 1 的当时生效断言（而非空库）为前态，撤回不会被漏记；否则成果包
+复核的“首次偏离”会被错判到后续恢复修订。零变化修订同样封口（只是没有变化行）；
+只补未封口修订，重复启动与在线提交交错（双方都在事务内先锁修订计数器行）均不重写、
+不漏记、不重复。推演并入的历史修订 `source` 按审计记录还原为 `projection_merge`，
+野外整包汇入 / 勘误分别还原为 `field_package` / `field_package_correction`。
+再次启动不会重复（按修订封口）。
 
 ```bash
 # 首屏
@@ -1136,6 +1144,8 @@ curl "$BASE/revision-changes?limit=100&cursor=eyJiIjo1LCJyIjoxLCJzIjozLCJ2IjoxfQ
 
 # 完整端到端示例（含失败批次 / 推演并入 / 路径变化 / 分页上界）
 bash examples/changes_demo.sh
+# 封口/待补交错下的启动回填核查示例（撤回不漏记 + 成果包首次偏离 + 交错封口重启回填 + 幂等）
+bash examples/revision_changes_backfill_demo.sh
 ```
 
 ## 推演（证据修订沙盘）
@@ -1413,6 +1423,16 @@ curl -s -X POST "$BASE/packages/1/reconcile" \
 bash examples/package_reconciliation_demo.sh
 ```
 
+“已封口修订与待补修订交错导致撤回漏记、首次偏离错判”的专项修复核查
+（在线造数 → 变化分页确认撤回行 → 复核确认 first_deviation → 模拟交错封口
+重启回填 → 二次重启幂等）：
+
+```bash
+bash examples/revision_changes_backfill_demo.sh
+# 自动化等价回归（嵌入式 PostgreSQL，无需手工重启）：
+PYTHONPATH=/tmp/pylibs python3 tests/test_revision_changes_backfill.py
+```
+
 ## 调用示例
 
 端到端 curl 演示（覆盖登记、批次、推导查询、冲突拒绝、撤回、定版与旧版不可变）：
@@ -1471,6 +1491,13 @@ bash examples/projection_demo.sh
 
 ```bash
 bash examples/changes_demo.sh
+```
+
+历史修订启动回填修复核查演示（已封口 / 待补修订交错时撤回不被漏记、
+成果包首次偏离=撤回修订、模拟交错封口重启回填、二次重启不重写 / 不重复）：
+
+```bash
+bash examples/revision_changes_backfill_demo.sh
 ```
 
 专题成果包封存演示（定版选层封存、路径途经未入选地层、乱序幂等一份、
@@ -1546,6 +1573,7 @@ examples/
   resilience_demo.sh # 撤回承受力分析示例（最小割/字典序最小/受保护不可达/原关系未定/拒绝）
   projection_demo.sh # 推演端到端示例（沙盘批次、并入成功与三类失败、空净变更）
   changes_demo.sh  # 修订变化追踪示例（变化/路径改变/失败批次/并入/游标分页）
+  revision_changes_backfill_demo.sh # 封口/待补交错启动回填修复核查（撤回不漏记/首次偏离/重启幂等）
   packages_demo.sh # 专题成果包示例（封存/幂等/不可变/拒绝分支）
   package_reconciliation_demo.sh # 成果包交付前复核示例（三类比较/首次偏离/曾偏离保留/只读拒绝）
   field_packages_demo.sh # 野外终端离线整包汇入示例（短号绑定/稳定编号/整批核验/幂等/拒绝分支）
@@ -1554,6 +1582,7 @@ examples/
   client_demo.py    # Python 客户端示例
 tests/
   test_relation_diffs_equivalence.py # 变化追踪候选精算 vs 全库逐对口径等价性（纯函数，无需数据库）
+  test_revision_changes_backfill.py  # 启动回填前态修复回归（真实 PostgreSQL：封口/待补交错撤回、首次偏离复核、零变化封口、重复启动幂等、回填与在线提交交错/持锁等待）
   test_preflight_holds.py            # 预检与临时保全联动回归：EVIDENCE_HELD 同构拒绝、受保全证据排除、解除恢复（内存假连接，无需数据库）
   test_relationship_view_consistency.py # 两类关系查询同视图回归（内存假连接：注入并发提交，断言修订号/结论/路径明细不混版）
   test_relationship_view_consistency_e2e.py # 同上的真实 PostgreSQL 端到端验证（语句门闩确定性交错 + 多线程压力）

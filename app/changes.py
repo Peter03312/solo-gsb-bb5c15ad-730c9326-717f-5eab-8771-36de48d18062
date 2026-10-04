@@ -15,7 +15,11 @@
 历史可追溯性：旧侧关系与路径均按**该修订提交前**的当时状态推导。后来才被
 撤回的证据在旧侧仍按当时生效解释（提交时刻已能拿到完整的当时断言集，无需
 回放后来的撤回）。服务启动时对部署前已存在的历史修订做幂等回填，使“已有
-历史修订也应可追溯”。
+历史修订也应可追溯”：每个待补修订的前态恒取**紧邻上一正式修订**（revision-1，
+无论其是否已封口）的当时生效断言，首版修订取空库——封口与待补修订交错时
+仍以“上一正式修订”而不是“上一个待补修订 / 空库”为前态，撤回类修订才不会
+被误记成首版新增（漏记撤回）。零变化修订同样封口；只补未封口修订，重复启动
+及与在线提交交错（双方先锁修订计数器行）不重写、不漏记、不重复。
 
 变化计算（性能口径）：一次局部断言变更不再对全库地层逐对重算。先依据提交
 前后生效断言集的差异定位**候选地层对**——每条新增 / 撤回证据在其存在的一侧，
@@ -263,13 +267,20 @@ def _active_assertions_at(cur, revision: Optional[int]) -> List[Assertion]:
 
 
 def backfill_revision_changes(cur) -> int:
-    """启动时幂等回填历史修订的变化记录，返回回填的修订数。
+    """启动时幂等回填历史修订的变化记录，返回回填（封口）的修订数。
 
-    以每个历史修订为界：地层取截至该修订提交时刻已登记的；
-    旧侧断言集取上一修订时刻（最早修订取空集），新侧取本修订时刻。
-    source 尽量按当时审计记录还原（推演并入的 batch 带 source=projection_merge），
-    其余为正式批次。在线提交与启动回填都写 revision_changes_sealed 封口标记，
-    故不重复。
+    每个待补修订 R 都以**紧邻上一正式修订 R-1 提交时刻的生效断言**为前态
+    （R=1 取空库），以 **R 提交时刻的生效断言**为后态；地层取截至 R 提交
+    时刻已登记的。封口修订与待补修订交错时必须如此：待补修订的上一修订可能
+    已封口（在线提交写过、或上轮回填过），前态仍以其**当时生效断言**为准，
+    而不能拿“上一个待补修订”或空库作前态——否则撤回类修订会被当成首版新增，
+    漏记撤回、旧态失真，成果包复核的首次偏离随之错判。
+
+    source 尽量按当时审计记录还原（推演并入的 batch 带 source=projection_merge、
+    野外整包汇入 / 勘误分别带 field_package / field_package_correction），
+    其余为正式批次。零变化修订同样写封口（只是没有变化行）。在线提交与启动
+    回填都写 revision_changes_sealed 封口标记，且都先对修订计数器行加排他锁，
+    故重复启动只补未封口修订、与在线提交交错也不重写、不漏记、不重复。
     """
     # 锁定修订计数器，回填与在线提交互斥（启动阶段实际无并发，双保险）
     cur.execute("SELECT revision FROM revision_counter WHERE id = TRUE FOR UPDATE")
@@ -285,9 +296,10 @@ def backfill_revision_changes(cur) -> int:
     cur.execute("SELECT stratum_id, created_at FROM strata")
     strata_created = {r[0]: r[1] for r in cur.fetchall()}
 
-    prev_revision: Optional[int] = None
     for revision, applied_at, batch in pending:
-        before_assertions = _active_assertions_at(cur, prev_revision)
+        # 前态恒取紧邻上一正式修订（revision - 1）的当时生效断言，不论它是否
+        # 已封口；修订 1 之前为空库（revision=None）。
+        before_assertions = _active_assertions_at(cur, revision - 1 if revision > 1 else None)
         after_assertions = _active_assertions_at(cur, revision)
         strata = [s for s, created in strata_created.items() if created <= applied_at]
         diffs = relation_diffs(strata, before_assertions, after_assertions)
@@ -300,7 +312,6 @@ def backfill_revision_changes(cur) -> int:
         else:
             source = "formal_batch"
         insert_revision_changes(cur, revision, diffs, source)
-        prev_revision = revision
     return len(pending)
 
 
